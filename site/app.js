@@ -19,8 +19,8 @@
   const CHUNK = 64 * 1024;              // data channel message size, safe across browsers
   const READ_BLOCK = 1024 * 1024;       // how much of a file to read from disk at a time
   const HIGH_WATER = 4 * 1024 * 1024;   // pause sending while this much is queued
-  const MAX_CANVAS_PIXELS = 16777216;   // iOS Safari's canvas size limit
-  const JPEG_QUALITY = 0.95;            // visually lossless
+  const STRIP_PIXELS = 4 * 1024 * 1024; // HEIC conversion works in strips this big (well under iOS canvas limits)
+  const JPEG_QUALITY = 95;              // visually lossless, no chroma subsampling
   const LOG_LIMIT = 300;
 
   // ---------- small helpers ----------
@@ -113,14 +113,16 @@
     const nameEl = el('div', { class: 'file-name', text: name, title: name });
     const metaEl = el('div', { class: 'file-meta' });
     const badge = el('span', { class: 'badge', hidden: true });
+    const info = el('span', { class: 'badge', hidden: true });
     const bar = el('div', { class: 'bar', hidden: true }, el('span'));
     if (meta) metaEl.append(el('span', { text: meta }));
-    metaEl.append(badge);
+    metaEl.append(info, badge);
     const li = el('li', { class: 'file' }, thumb, el('div', { class: 'file-main' }, nameEl, metaEl, bar), extra || el('span'));
     return {
       li,
       setName(n) { nameEl.textContent = n; nameEl.title = n; },
       setBadge(text, kind) { badge.textContent = text; badge.className = 'badge' + (kind ? ' ' + kind : ''); badge.hidden = !text; },
+      setInfo(text, kind, title) { info.textContent = text; info.className = 'badge' + (kind ? ' ' + kind : ''); info.hidden = !text; info.title = title || ''; },
       setProgress(frac) {
         if (frac == null) { bar.hidden = true; return; }
         bar.hidden = false;
@@ -722,6 +724,9 @@
         item.key = 'nokey-' + randomHex(8);
       }
       if (item.status !== 'checking') continue; // removed meanwhile
+      const md = describeMetadata(await readMetadata(item.file, item.file.type, item.file.name));
+      if (md) item.row.setInfo(md.text, md.kind, md.title);
+      if (item.status !== 'checking') continue;
       item.status = 'ready';
       item.check.disabled = false;
       const prev = sent[item.key] || tx.items.find((o) => o !== item && o.key === item.key && o.status !== 'removed');
@@ -865,7 +870,7 @@
     if (!conn) throw new Error('Not connected');
     item.status = 'sending';
     item.row.setBadge('Preparing…', 'busy');
-    const p = await prepare(item.file);
+    const p = await prepare(item.file, (frac) => item.row.setBadge(`Converting to JPEG ${Math.round(frac * 100)}%`, 'busy'));
     if (p.name !== item.file.name) item.row.setName(p.name);
     const id = randomHex(8);
     conn.send(JSON.stringify({ t: 'offer', id, name: p.name, size: p.blob.size, type: p.type, hash: item.key, force: item.force }));
@@ -914,7 +919,8 @@
     if (result.t === 'failed') throw new Error(result.reason || 'Laptop could not save it');
     markDone('sent');
     item.row.setProgress(1);
-    item.row.setBadge(result.saveAs && result.saveAs !== p.name ? 'Saved as ' + result.saveAs : 'Saved' + (p.note ? ' · ' + p.note : ''), 'ok');
+    const label = result.saveAs && result.saveAs !== p.name ? 'Saved as ' + result.saveAs : 'Saved';
+    item.row.setBadge(label + (p.note ? ' · ' + p.note : ''), p.note && p.type !== 'image/jpeg' ? 'warn' : 'ok');
     return 'sent';
   }
 
@@ -930,25 +936,278 @@
     });
   }
 
-  // ----- JPEG conversion -----
-  // JPEGs are sent untouched (no re-compression, metadata kept). Other still
-  // images (HEIC, PNG, WebP…) are converted to full-resolution JPEG at 95%.
-  // GIFs and videos are sent as they are.
-  async function prepare(file) {
-    const name = file.name || 'photo';
-    const type = file.type || '';
-    const convertible = !isVideo(type, name) && !isJpeg(type, name) &&
-      (type.startsWith('image/') || /\.(heic|heif|png|webp|tiff?|bmp)$/i.test(name)) &&
-      !/gif/i.test(type) && !/\.gif$/i.test(name);
-    if (!convertible) return { blob: file, name, type: type || 'application/octet-stream' };
-    try {
-      const blob = await toJpeg(file);
-      const dot = name.lastIndexOf('.');
-      return { blob, name: (dot > 0 ? name.slice(0, dot) : name) + '.jpg', type: 'image/jpeg', note: 'converted to JPEG' };
-    } catch (e) {
-      console.warn('JPEG conversion failed, sending original', e);
-      return { blob: file, name, type: type || 'application/octet-stream', note: e.tooLarge ? 'too large to convert, sent original' : 'sent original' };
+  // ----- metadata & HEIC conversion -----
+  // Only Apple's HEIC/HEIF photos are converted. Everything else (JPEG, PNG,
+  // videos, …) is sent byte for byte, so its metadata stays exactly as it was.
+  // HEIC photos are re-encoded as full-resolution JPEG (quality 95, no chroma
+  // subsampling) and their Exif and XMP metadata are copied across: date and
+  // time, location, camera and lens details. The conversion runs in strips so
+  // 24 and 48 MP photos fit within iPhone memory and canvas limits.
+
+  const isHeic = (type, name) => /^image\/hei[cf](-sequence)?$/i.test(type || '') || /\.(heic|heif|hif)$/i.test(name || '');
+  const isPng = (type, name) => /^image\/png$/i.test(type || '') || /\.png$/i.test(name || '');
+
+  const bytes = async (blob, start, end) => new Uint8Array(await blob.slice(start, end).arrayBuffer());
+  const fourcc = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  const latin1 = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0));
+
+  function indexOfBytes(hay, needle) {
+    const first = needle[0];
+    outer: for (let i = hay.indexOf(first); i !== -1 && i <= hay.length - needle.length; i = hay.indexOf(first, i + 1)) {
+      for (let j = 1; j < needle.length; j++) if (hay[i + j] !== needle[j]) continue outer;
+      return i;
     }
+    return -1;
+  }
+
+  // ISO base media boxes (HEIC, MOV, MP4) inside a byte array.
+  function boxesIn(b, start, end) {
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    const list = [];
+    let p = start;
+    while (p + 8 <= end) {
+      let size = dv.getUint32(p);
+      let hdr = 8;
+      if (size === 1) { size = Number(dv.getBigUint64(p + 8)); hdr = 16; }
+      else if (size === 0) size = end - p;
+      if (size < hdr || p + size > end) break;
+      list.push({ type: fourcc(b, p + 4), start: p + hdr, end: p + size });
+      p += size;
+    }
+    return list;
+  }
+
+  // Top-level boxes of a file, reading only their headers.
+  async function topBoxes(file) {
+    const list = [];
+    let p = 0;
+    while (p + 8 <= file.size && list.length < 100) {
+      const h = await bytes(file, p, p + 16);
+      const dv = new DataView(h.buffer);
+      let size = dv.getUint32(0);
+      let hdr = 8;
+      if (size === 1) { size = Number(dv.getBigUint64(8)); hdr = 16; }
+      else if (size === 0) size = file.size - p;
+      if (size < hdr) break;
+      list.push({ type: fourcc(h, 4), start: p + hdr, end: Math.min(p + size, file.size) });
+      p += size;
+    }
+    return list;
+  }
+
+  // Pull the Exif (TIFF) and XMP blocks out of a HEIC file.
+  async function heicMetadata(file) {
+    const meta = (await topBoxes(file)).find((b) => b.type === 'meta');
+    if (!meta || meta.end - meta.start > 32 * 1024 * 1024) return {};
+    const m = await bytes(file, meta.start, meta.end);
+    const dv = new DataView(m.buffer);
+    const kids = boxesIn(m, 4, m.length); // 'meta' is a full box: skip version/flags
+    const items = [];
+    const iinf = kids.find((k) => k.type === 'iinf');
+    if (iinf) {
+      const first = iinf.start + 4 + (m[iinf.start] === 0 ? 2 : 4);
+      for (const infe of boxesIn(m, first, iinf.end)) {
+        const v = m[infe.start];
+        if (infe.type !== 'infe' || v < 2) continue;
+        let q = infe.start + 4;
+        const id = v === 2 ? dv.getUint16(q) : dv.getUint32(q);
+        q += (v === 2 ? 2 : 4) + 2;
+        const type = fourcc(m, q);
+        q += 4;
+        let mime = '';
+        if (type === 'mime') {
+          while (q < infe.end && m[q]) q++; // item_name
+          const s = ++q;
+          while (q < infe.end && m[q]) q++;
+          mime = new TextDecoder().decode(m.subarray(s, q));
+        }
+        items.push({ id, type, mime });
+      }
+    }
+    const locs = {};
+    const iloc = kids.find((k) => k.type === 'iloc');
+    const idat = kids.find((k) => k.type === 'idat');
+    if (iloc) {
+      const v = m[iloc.start];
+      let q = iloc.start + 4;
+      const read = (n) => { let x = 0; for (let i = 0; i < n; i++) x = x * 256 + m[q + i]; q += n; return x; };
+      const offSize = m[q] >> 4, lenSize = m[q] & 15, baseSize = m[q + 1] >> 4;
+      const idxSize = v === 1 || v === 2 ? m[q + 1] & 15 : 0;
+      q += 2;
+      const count = read(v < 2 ? 2 : 4);
+      for (let i = 0; i < count && q < iloc.end; i++) {
+        const id = read(v < 2 ? 2 : 4);
+        const method = v === 1 || v === 2 ? read(2) & 15 : 0;
+        read(2); // data_reference_index
+        const base = read(baseSize);
+        const extents = [];
+        for (let n = read(2); n > 0; n--) {
+          if (idxSize) read(idxSize);
+          const off = read(offSize);
+          extents.push([base + off, read(lenSize)]);
+        }
+        locs[id] = { method, extents };
+      }
+    }
+    const readItem = async (id) => {
+      const loc = locs[id];
+      if (!loc) return null;
+      const parts = [];
+      for (const [off, len] of loc.extents) {
+        if (loc.method === 0) parts.push(await bytes(file, off, len ? off + len : file.size));
+        else if (loc.method === 1 && idat) parts.push(m.slice(idat.start + off, idat.start + off + len));
+        else return null;
+      }
+      return parts.length === 1 ? parts[0] : new Uint8Array(await new Blob(parts).arrayBuffer());
+    };
+    let exif = null, xmp = null;
+    for (const it of items) {
+      if (it.type === 'Exif' && !exif) {
+        const d = await readItem(it.id);
+        if (d && d.length > 8) {
+          exif = d.subarray(4 + new DataView(d.buffer, d.byteOffset).getUint32(0));
+          if (fourcc(exif, 0) === 'Exif') exif = exif.subarray(6);
+        }
+      } else if (it.type === 'mime' && /rdf\+xml|xmp/i.test(it.mime) && !xmp) {
+        xmp = await readItem(it.id);
+      }
+    }
+    return { exif, xmp };
+  }
+
+  // Read the parts of a TIFF/Exif block we care about.
+  function tiffInfo(t) {
+    if (!t || t.length < 8) return null;
+    const le = t[0] === 0x49 && t[1] === 0x49;
+    if (!le && !(t[0] === 0x4d && t[1] === 0x4d)) return null;
+    const dv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+    const u16 = (o) => dv.getUint16(o, le), u32 = (o) => dv.getUint32(o, le);
+    const ifd = (o) => {
+      const tags = {};
+      if (!o || o + 2 > t.length) return tags;
+      const n = u16(o);
+      for (let i = 0; i < n; i++) {
+        const e = o + 2 + i * 12;
+        if (e + 12 > t.length) break;
+        tags[u16(e)] = { type: u16(e + 2), count: u32(e + 4), value: e + 8 };
+      }
+      return tags;
+    };
+    const ascii = (tag) => {
+      if (!tag || tag.type !== 2) return null;
+      const off = tag.count <= 4 ? tag.value : u32(tag.value);
+      if (off + tag.count > t.length) return null;
+      return new TextDecoder().decode(t.subarray(off, off + tag.count)).replace(/\0[\s\S]*$/, '').trim() || null;
+    };
+    const ifd0 = ifd(u32(4));
+    const exifIfd = ifd0[0x8769] ? ifd(u32(ifd0[0x8769].value)) : {};
+    const gpsIfd = ifd0[0x8825] ? ifd(u32(ifd0[0x8825].value)) : {};
+    return {
+      le, dv, ifd0, exifIfd,
+      date: ascii(exifIfd[0x9003]) || ascii(exifIfd[0x9004]) || ascii(ifd0[0x0132]),
+      gps: !!(gpsIfd[0x0002] && gpsIfd[0x0004]),
+    };
+  }
+
+  async function jpegExif(blob) {
+    const b = await bytes(blob, 0, Math.min(blob.size, 512 * 1024));
+    if (b[0] !== 0xff || b[1] !== 0xd8) return null;
+    let p = 2;
+    while (p + 4 <= b.length && b[p] === 0xff) {
+      const marker = b[p + 1];
+      if (marker === 0xda || marker === 0xd9) break;
+      const len = (b[p + 2] << 8) | b[p + 3];
+      if (marker === 0xe1 && fourcc(b, p + 4) === 'Exif') return b.subarray(p + 10, Math.min(b.length, p + 2 + len));
+      p += 2 + len;
+    }
+    return null;
+  }
+
+  async function pngExif(blob) {
+    const b = await bytes(blob, 0, Math.min(blob.size, 4 * 1024 * 1024));
+    const dv = new DataView(b.buffer);
+    for (let p = 8; p + 8 <= b.length;) {
+      const len = dv.getUint32(p);
+      const type = fourcc(b, p + 4);
+      if (type === 'eXIf') return b.subarray(p + 8, p + 8 + len);
+      if (type === 'IEND') break;
+      p += 12 + len;
+    }
+    return null;
+  }
+
+  async function videoMetadata(file) {
+    const moov = (await topBoxes(file)).find((b) => b.type === 'moov');
+    if (!moov || moov.end - moov.start > 32 * 1024 * 1024) return null;
+    const m = await bytes(file, moov.start, moov.end);
+    const mvhd = boxesIn(m, 0, m.length).find((b) => b.type === 'mvhd');
+    let created = false;
+    if (mvhd) {
+      const dv = new DataView(m.buffer);
+      created = m[mvhd.start] === 1 ? dv.getBigUint64(mvhd.start + 4) > 0n : dv.getUint32(mvhd.start + 4) > 0;
+    }
+    return {
+      date: created || indexOfBytes(m, latin1('com.apple.quicktime.creationdate')) >= 0,
+      gps: indexOfBytes(m, latin1('com.apple.quicktime.location.ISO6709')) >= 0 || indexOfBytes(m, latin1('©xyz')) >= 0,
+    };
+  }
+
+  // What metadata a file carries: {date, gps}, or null if we can't tell.
+  async function readMetadata(file, type, name) {
+    try {
+      if (isVideo(type, name)) return await videoMetadata(file);
+      let tiff = null;
+      if (isHeic(type, name)) tiff = (await heicMetadata(file)).exif;
+      else if (isJpeg(type, name)) tiff = await jpegExif(file);
+      else if (isPng(type, name)) tiff = await pngExif(file);
+      else return null;
+      const info = tiffInfo(tiff);
+      return { date: !!(info && info.date), gps: !!(info && info.gps) };
+    } catch (e) {
+      console.warn('Could not read metadata', e);
+      return null;
+    }
+  }
+
+  function describeMetadata(md) {
+    if (!md) return null;
+    if (md.date && md.gps) return { text: 'Date · Location', kind: 'ok', title: 'Has the date taken and location' };
+    if (md.date) return { text: 'Date · no location', kind: 'warn', title: 'Has the date taken, but no location was in the file' };
+    if (md.gps) return { text: 'Location · no date', kind: 'warn', title: 'Has a location, but no date taken was in the file' };
+    return { text: 'No date or location', kind: 'warn', title: 'No date taken or location was in the file' };
+  }
+
+  function app1(header, body) {
+    const len = 2 + header.length + body.length;
+    if (len > 0xffff) throw new Error('Metadata block too large for JPEG');
+    const seg = new Uint8Array(2 + len);
+    seg.set([0xff, 0xe1, len >> 8, len & 0xff]);
+    seg.set(header, 4);
+    seg.set(body, 4 + header.length);
+    return seg;
+  }
+
+  // The JPEG's pixels are written already upright, so Orientation becomes 1.
+  function exifForJpeg(tiff, width, height) {
+    const t = tiff.slice();
+    const info = tiffInfo(t);
+    if (!info) return null;
+    const set = (tag, v) => {
+      if (!tag) return;
+      if (tag.type === 3) info.dv.setUint16(tag.value, v, info.le);
+      else if (tag.type === 4) info.dv.setUint32(tag.value, v, info.le);
+    };
+    set(info.ifd0[0x0112], 1);
+    set(info.exifIfd[0xa002], width);
+    set(info.exifIfd[0xa003], height);
+    return t;
+  }
+
+  function xmpForJpeg(xmp) {
+    const s = new TextDecoder().decode(xmp)
+      .replace(/tiff:Orientation="\d"/g, 'tiff:Orientation="1"')
+      .replace(/<tiff:Orientation>\d<\/tiff:Orientation>/g, '<tiff:Orientation>1</tiff:Orientation>');
+    return new TextEncoder().encode(s);
   }
 
   async function decodeImage(file) {
@@ -965,27 +1224,64 @@
     return { source: img, width: img.naturalWidth, height: img.naturalHeight, done: () => URL.revokeObjectURL(url) };
   }
 
-  async function toJpeg(file) {
+  async function heicToJpeg(file, onProgress) {
+    const meta = await heicMetadata(file);
     const img = await decodeImage(file);
     try {
-      if (img.width * img.height > MAX_CANVAS_PIXELS) {
-        const err = new Error('Image too large to convert in the browser');
-        err.tooLarge = true;
-        throw err;
+      const { width: W, height: H } = img;
+      if (!W || !H) throw new Error('Could not read the image');
+      const segments = [];
+      if (meta.exif) {
+        const exif = exifForJpeg(meta.exif, W, H);
+        if (!exif) throw new Error('Unreadable Exif metadata');
+        segments.push(app1(latin1('Exif\0\0'), exif));
       }
+      if (meta.xmp) segments.push(app1(latin1('http://ns.adobe.com/xap/1.0/\0'), xmpForJpeg(meta.xmp)));
+
+      const rows = Math.max(8, Math.floor(STRIP_PIXELS / W / 8) * 8);
       const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#fff'; // JPEG has no transparency
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img.source, 0, 0);
-      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', JPEG_QUALITY));
+      canvas.width = W;
+      canvas.height = Math.min(rows, H);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      const enc = new window.MattoJpegEncoder(JPEG_QUALITY);
+      enc.begin(W, H, segments);
+      const parts = [];
+      for (let y = 0; y < H; y += rows) {
+        const h = Math.min(rows, H - y);
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, W, canvas.height);
+        ctx.drawImage(img.source, 0, y, W, h, 0, 0, W, h);
+        enc.addStrip(ctx.getImageData(0, 0, W, h).data, h);
+        parts.push(...enc.take());
+        if (onProgress) onProgress((y + h) / H);
+        await new Promise((r) => setTimeout(r, 0)); // keep the page responsive
+      }
+      parts.push(...enc.finish());
       canvas.width = canvas.height = 0; // free memory right away on iOS
-      if (!blob) throw new Error('Conversion produced no image');
-      return blob;
+      return new Blob(parts, { type: 'image/jpeg' });
     } finally {
       img.done();
+    }
+  }
+
+  async function prepare(file, onProgress) {
+    const name = file.name || 'photo';
+    const type = file.type || '';
+    const original = { blob: file, name, type: type || 'application/octet-stream' };
+    if (!isHeic(type, name)) return original;
+    try {
+      const blob = await heicToJpeg(file, onProgress);
+      // Never trade metadata for the conversion: check it all made it across.
+      const before = await readMetadata(file, type, name);
+      const after = await readMetadata(blob, 'image/jpeg', 'x.jpg');
+      if (before && (!after || (before.date && !after.date) || (before.gps && !after.gps))) {
+        throw new Error('Metadata did not carry over');
+      }
+      const dot = name.lastIndexOf('.');
+      return { blob, name: (dot > 0 ? name.slice(0, dot) : name) + '.jpg', type: 'image/jpeg', note: 'converted to JPEG' };
+    } catch (e) {
+      console.warn('HEIC conversion failed, sending the original', e);
+      return { ...original, note: "couldn't convert, sent as HEIC" };
     }
   }
 

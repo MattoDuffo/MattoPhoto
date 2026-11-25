@@ -16,10 +16,13 @@ the same pairing code, so the home-screen icon connects straight to it next time
 
 - The phone and laptop connect directly with WebRTC. [PeerJS](https://peerjs.com)'s public
   server is used only to introduce the two devices; photos never pass through it.
-- JPEGs and videos are sent untouched. Other images (HEIC, PNG, WebP) are converted on the
-  phone to full-resolution JPEG at 95% quality. Converted images lose their metadata
-  (date taken, location); images over about 16 megapixels can't be converted in the
-  browser and are sent as the original file.
+- Only Apple's HEIC/HEIF photos are converted, to full-resolution JPEG at quality 95 with no
+  chroma subsampling. Their Exif and XMP metadata (date and time, location, camera and lens)
+  is copied into the JPEG. If a photo can't be converted, or its metadata wouldn't fully
+  carry over, the original HEIC is sent instead. Everything else (JPEG, PNG, videos) is sent
+  byte for byte, so its metadata is untouched.
+- Each picked file shows whether it has a date and a location, so anything iOS removed
+  before the app received it is visible.
 - Duplicates are caught twice: the phone remembers what it sent, and the laptop skips files
   it has received before or that already exist in the folder with the same name and size.
 - Without Chrome/Edge folder access, files go to the Downloads folder.
@@ -28,4 +31,5 @@ the same pairing code, so the home-screen icon connects straight to it next time
 
 Everything lives in `site/` and is plain HTML, CSS and JavaScript with no build step.
 `.github/workflows/pages.yml` publishes `site/` to GitHub Pages on every push to `main`.
-PeerJS 1.5.4 and qrcode-generator 1.4.4 (both MIT) are bundled in `site/vendor/`.
+PeerJS 1.5.4 and qrcode-generator 1.4.4 (both MIT) are bundled in `site/vendor/`, along with
+a JPEG encoder adapted from jpeg-js 0.4.4 (BSD) to encode large photos in strips.
